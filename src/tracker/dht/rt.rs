@@ -21,6 +21,7 @@ pub struct RoutingTable {
     transactions: HashMap<u32, Transaction>,
     torrents: HashMap<[u8; 20], Torrent>,
     bootstrapping: bool,
+    dummy: Node,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,6 +64,7 @@ pub struct Node {
     token: Vec<u8>,
     prev_token: Vec<u8>,
     rem_token: Option<Vec<u8>>,
+    dummy: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,6 +92,7 @@ impl RoutingTable {
             transactions: HashMap::new(),
             torrents: HashMap::new(),
             bootstrapping: true,
+            dummy: Node::dummy(),
         }
     }
 
@@ -119,7 +122,12 @@ impl RoutingTable {
         hash: [u8; 20],
     ) -> Vec<(proto::Request, SocketAddr)> {
         let tid = BigUint::from_bytes_be(&hash[..]);
-        let idx = self.bucket_idx(&tid);
+        let idx = if let Some(idx) = self.bucket_idx(&tid) {
+            idx
+        } else {
+            self.dump_state(&tid);
+            return vec![];
+        };
         let mut nodes: Vec<proto::Node> = Vec::new();
 
         for node in &self.buckets[idx].nodes {
@@ -172,9 +180,12 @@ impl RoutingTable {
                 if self.contains_id(&target) {
                     nodes.push(self.get_node(&target).into())
                 } else {
-                    let b = self.bucket_idx(&target);
-                    for node in &self.buckets[b].nodes {
-                        nodes.push(node.into());
+                    if let Some(b) = self.bucket_idx(&target) {
+                        for node in &self.buckets[b].nodes {
+                            nodes.push(node.into());
+                        }
+                    } else {
+                        self.dump_state(&target);
                     }
                 }
                 proto::Response::find_node(req.transaction, self.id.clone(), nodes)
@@ -224,9 +235,12 @@ impl RoutingTable {
                     proto::Response::peers(req.transaction, self.id.clone(), token, t.peers.clone())
                 } else {
                     let mut nodes = Vec::new();
-                    let b = self.bucket_idx(&BigUint::from_bytes_be(&hash[..]));
-                    for node in &self.buckets[b].nodes {
-                        nodes.push(node.into());
+                    if let Some(b) = self.bucket_idx(&BigUint::from_bytes_be(&hash[..])) {
+                        for node in &self.buckets[b].nodes {
+                            nodes.push(node.into());
+                        }
+                    } else {
+                        self.dump_state(&BigUint::from_bytes_be(&hash[..]));
                     }
                     proto::Response::nodes(req.transaction, self.id.clone(), token, nodes)
                 }
@@ -465,20 +479,32 @@ impl RoutingTable {
     }
 
     fn get_node_mut(&mut self, id: &ID) -> &mut Node {
-        let idx = self.bucket_idx(id);
-        let bidx = self.buckets[idx].idx_of(id).unwrap();
-        &mut self.buckets[idx].nodes[bidx]
+        if let Some(idx) = self.bucket_idx(id) {
+            let bidx = self.buckets[idx].idx_of(id).unwrap();
+            &mut self.buckets[idx].nodes[bidx]
+        } else {
+            self.dump_state(id);
+            &mut self.dummy
+        }
     }
 
     fn get_node(&self, id: &ID) -> &Node {
-        let idx = self.bucket_idx(id);
-        let bidx = self.buckets[idx].idx_of(id).unwrap();
-        &self.buckets[idx].nodes[bidx]
+        if let Some(idx) = self.bucket_idx(id) {
+            let bidx = self.buckets[idx].idx_of(id).unwrap();
+            &self.buckets[idx].nodes[bidx]
+        } else {
+            self.dump_state(id);
+            &self.dummy
+        }
     }
 
     fn contains_id(&self, id: &ID) -> bool {
-        let idx = self.bucket_idx(id);
-        self.buckets[idx].contains(id)
+        if let Some(idx) = self.bucket_idx(id) {
+            self.buckets[idx].contains(id)
+        } else {
+            self.dump_state(id);
+            false
+        }
     }
 
     fn new_init_tx(&mut self) -> Vec<u8> {
@@ -529,7 +555,12 @@ impl RoutingTable {
     }
 
     fn add_node(&mut self, node: Node) -> Result<(), ()> {
-        let idx = self.bucket_idx(&node.id);
+        let idx = if let Some(idx) = self.bucket_idx(&node.id) {
+            idx
+        } else {
+            self.dump_state(&node.id);
+            return Err(());
+        };
         if self.buckets[idx].full() {
             if self.buckets[idx].could_hold(&self.id) && self.buckets.len() < MAX_BUCKETS {
                 self.split_bucket(idx);
@@ -544,9 +575,12 @@ impl RoutingTable {
     }
 
     fn remove_node(&mut self, id: &ID) {
-        let idx = self.bucket_idx(id);
-        if let Some(i) = self.buckets[idx].idx_of(id) {
-            self.buckets[idx].nodes.remove(i);
+        if let Some(idx) = self.bucket_idx(id) {
+            if let Some(i) = self.buckets[idx].idx_of(id) {
+                self.buckets[idx].nodes.remove(i);
+            }
+        } else {
+            self.dump_state(id);
         }
     }
 
@@ -569,7 +603,7 @@ impl RoutingTable {
         self.buckets.insert(idx + 1, nb);
     }
 
-    fn bucket_idx(&self, id: &ID) -> usize {
+    fn bucket_idx(&self, id: &ID) -> Option<usize> {
         self.buckets
             .binary_search_by(|bucket| {
                 if bucket.could_hold(id) {
@@ -577,8 +611,11 @@ impl RoutingTable {
                 } else {
                     bucket.start.cmp(id)
                 }
-            })
-            .unwrap()
+            }).ok()
+    }
+
+    fn dump_state(&self, id: &ID) {
+        error!("FAILED TO FIND DHT BUCKET CORRECTLY WITH ID: {:?}, BUCKETS: {:?}", id, self.buckets);
     }
 }
 
@@ -637,6 +674,21 @@ impl Node {
             prev_token: token.clone(),
             rem_token: None,
             token: token,
+            dummy: false,
+        }
+    }
+
+    fn dummy() -> Node {
+        let token = Node::create_token();
+        Node {
+            id: id_from_pow(0),
+            state: NodeState::Bad,
+            addr: "127.0.0.1:0".parse().unwrap(),
+            last_updated: Utc::now(),
+            prev_token: token.clone(),
+            rem_token: None,
+            token: token,
+            dummy: true,
         }
     }
 
